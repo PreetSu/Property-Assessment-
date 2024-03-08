@@ -1,0 +1,693 @@
+---
+title: "Proprty Assessment"
+author: "Preethi Peelamedu Surendran"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: simplex
+    number_sections: false
+---
+
+```{r}
+# Total time to execute notebook: 10 minutes
+# Note: Lasso and Random Forecast won't execute in the code, they were analysed prior to final algorithm selection - Gradient Boost - XGBoost
+```
+
+
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+knitr::knit_meta(clean=T)
+```
+
+```{r}
+# Set the scipen option to 999 to avoid scientific notation when printing numeric values
+options(scipen = 999)
+
+```
+
+# 0 Load the packages 
+```{r}
+library(tidyverse)
+library(glmnet)
+library(caret)
+library(rpart)
+library(randomForest)
+library(xgboost)
+
+```
+
+# 1 Data Inspection
+```{r}
+# load the data as dataframe
+data <- read.csv("historic_property_data.csv")
+
+# first six rows
+head(data)
+
+# column names
+names(data)
+
+# structure
+str(data)
+
+# size
+dim(data)
+
+```
+
+# 2 Data Cleaning and Preprocessing
+## 2.1 Keep variables that are potentially outcome and predictors.
+```{r}
+# keep the predictors and outcome variables in data frame
+
+# By observation - meta_town_code and meta_nbhd are hierarchical variables, meta_town_code has both the information of town and neighborhood so meta_nbhd is sufficient - remove meta_town_code.
+
+# neighborhood characteristics, tax rates, and school district boundaries correlate with each other in real estate assessment as these are related to particular neighborhood. geo_school_elem_district, geo_school_hs_district, econ_tax_rate and econ_midincome are removed.
+
+data <- data[, c('sale_price', 'meta_nbhd', 'char_hd_sf', 'char_age', 'char_apts', 'char_ext_wall', 'char_roof_cnst', 'char_rooms', 'char_beds', 'char_bsmt', 'char_bsmt_fin', 'char_heat', 'char_oheat', 'char_air', 'char_frpl', 'char_attic_type', 'char_fbath', 'char_hbath', 'char_tp_plan', 'char_tp_dsgn', 'char_gar1_size', 'char_gar1_cnst', 'char_gar1_att', 'char_gar1_area', 'char_bldg_sf', 'char_use', 'char_type_resd', 'char_attic_fnsh', 'char_porch', 'geo_ohare_noise', 'geo_floodplain', 'geo_fs_flood_factor', 'geo_fs_flood_risk_direction', 'geo_withinmr100', 'geo_withinmr101300')]
+
+
+# rename the columns
+colnames(data) <- c('sale_price', 'nbhd_code', 'land_area_sqft', 'property_age', 'number_apts', 'ext_wall_material', 'roof_material', 'number_rooms', 'number_beds', 'basement_type', 'basement_finish', 'central_heating', 'other_heating', 'central_air_conditioning', 'number_fireplaces', 'attic_type', 'number_full_bath', 'number_half_bath', 'design_plan', 'cathedral_ceiling', 'garage_size', 'garage_material', 'garage_attached', 'garage_area', 'buidling_area_sqft', 'usage_type', 'residence_type', 'attic_finish', 'porch_type', 'noise_indicator', 'fema_floodplain', 'flood_risk_factor', 'food_risk_direction', 'road_prox_within_100', 'road_prox_within_101_to_300')
+# first six rows 
+head(data)
+
+# size
+dim(data)
+
+categorical_vars <- c('ext_wall_material', 'roof_material', 'basement_type', 'central_heating', 'garage_size', 'residence_type', 'nbhd_code', 'flood_risk_factor' )
+
+# convert to categorical
+data[categorical_vars] <- lapply(data[categorical_vars], as.factor)
+
+
+```
+
+## 2.2 Remove variables which has missing values above threshold set - 10%
+```{r}
+# threshold in number of rows for missing values in each variable
+threshold <- 0.1 * nrow(data)
+
+# function to check the number of missing values above threshold
+count_missing_above_threshold <- function(column) {
+  sum(is.na(column)) > threshold
+}
+
+# Use sapply to find columns with missing value counts above the threshold
+to_drop <- sapply(data, count_missing_above_threshold)
+
+# Drop these columns from the data frame
+data <- data[, !to_drop]
+
+# structure
+str(data)
+
+# size
+dim(data)
+
+# first six rows
+head(data)
+
+```
+
+## 2.3 Remove variables which has less or more unique values
+```{r}
+min_unique_values <- 5 # Minimum number of unique values
+max_unique_pct <- 0.95 # Maximum percentage of unique values
+
+# function to check if a variable meets the criteria
+has_sufficient_unique <- function(x, min_unique, max_unique_pct) {
+  num_unique <- length(unique(x))
+  return(num_unique >= min_unique & num_unique <= (max_unique_pct * length(x)))
+}
+
+# use sapply to find columns that don't meet the criteria
+not_meeting_criteria <- sapply(
+  data, 
+  has_sufficient_unique, 
+  min_unique = min_unique_values, 
+  max_unique_pct = max_unique_pct
+)
+
+# drop these columns from the dataframe
+data <- data[, not_meeting_criteria]
+
+# size
+dim(data)
+
+# first six rows
+head(data)
+
+```
+
+# 3 Data Preparation
+## 3.1 Data Parition
+```{r}
+# total number of rows
+dim(data)[1]
+
+# size of the training set 
+dim(data)[1]*0.6
+
+# set seed 
+set.seed(1)
+
+# row index of the training set  
+train.index <- sample(c(1:dim(data)[1]), dim(data)[1]*0.6)
+head(train.index)
+
+# training set 
+train.df <- data[train.index, ]
+head(train.df)
+
+# test set 
+test.df <- data[-train.index, ]
+head(test.df)
+
+```
+
+## 3.2 Replace missing values with non-missing values in the same location group
+```{r}
+# number of NA in each variable
+sapply(train.df, function(x) sum(is.na(x)))
+
+# function to calculate the mode (most common element)
+get_mode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# impute missing values based on the median or mode of 'nbhd_code'(neighborhood). Because we assume that the following characteristics can be quite consistent within the same neighborhood.
+train.df <- train.df %>%
+  group_by(nbhd_code) %>%
+  mutate(
+    ext_wall_material = ifelse(is.na(ext_wall_material), get_mode(ext_wall_material), ext_wall_material),
+    roof_material = ifelse(is.na(roof_material), get_mode(roof_material), roof_material),
+    basement_type = ifelse(is.na(basement_type), get_mode(basement_type), basement_type),
+    central_heating = ifelse(is.na(central_heating), get_mode(central_heating), central_heating),
+    number_fireplaces = ifelse(is.na(number_fireplaces), median(number_fireplaces, na.rm = TRUE), number_fireplaces),
+    garage_size = ifelse(is.na(garage_size), get_mode(garage_size), garage_size),
+    residence_type = ifelse(is.na(residence_type), get_mode(residence_type), residence_type),
+    flood_risk_factor = ifelse(is.na(flood_risk_factor), get_mode(flood_risk_factor), flood_risk_factor)
+  )
+
+# check the missing values 
+missing_values_train <- colSums(is.na(train.df))
+missing_values_train
+
+# convert to data frame from tibble
+train.df <- data.frame(train.df)
+head(train.df)
+
+# impute missing values based on the median or mode of 'nbhd_code'(neighborhood). Because we assume that the following characteristics can be quite consistent within the same neighborhood.
+test.df <- test.df %>%
+  group_by(nbhd_code) %>%
+  mutate(
+    ext_wall_material = ifelse(is.na(ext_wall_material), get_mode(ext_wall_material), ext_wall_material),
+    roof_material = ifelse(is.na(roof_material), get_mode(roof_material), roof_material),
+    basement_type = ifelse(is.na(basement_type), get_mode(basement_type), basement_type),
+    central_heating = ifelse(is.na(central_heating), get_mode(central_heating), central_heating),
+    number_fireplaces = ifelse(is.na(number_fireplaces), median(number_fireplaces, na.rm = TRUE), number_fireplaces),
+    garage_size = ifelse(is.na(garage_size), get_mode(garage_size), garage_size),
+    residence_type = ifelse(is.na(residence_type), get_mode(residence_type), residence_type),
+    flood_risk_factor = ifelse(is.na(flood_risk_factor), get_mode(flood_risk_factor), flood_risk_factor)
+  )
+
+# check the missing values
+missing_values_test <- colSums(is.na(test.df))
+missing_values_test
+
+
+# convert to data frame from tibble
+test.df <- data.frame(test.df)
+head(test.df)
+
+
+```
+
+## 3.3 Winsorize numeric variables
+```{r}
+
+# Threshold lower_percentile = 0.05, higher_percentile = 0.95
+
+# custom function to winsorize a vector
+winsorize <- function(x, low_perc = 0.05, high_perc = 0.95) {
+  quantiles <- quantile(x, probs = c(low_perc, high_perc), na.rm = TRUE)
+  x[x < quantiles[1]] <- quantiles[1]
+  x[x > quantiles[2]] <- quantiles[2]
+  x
+}
+
+# winsorize multiple columns
+numeric_vars_train <- sapply(train.df, is.numeric)
+train.df[numeric_vars_train] <- lapply(train.df[numeric_vars_train], winsorize)
+
+# summary
+summary(train.df)
+
+# winsorize multiple columns
+numeric_vars_test <- sapply(test.df, is.numeric)
+test.df[numeric_vars_test] <- lapply(test.df[numeric_vars_test], winsorize)
+
+# summary
+summary(test.df)
+
+```
+
+## 3.4 Convert some numeric variables to factors
+```{r}
+# list of variables that needs to be converted
+categorical_vars <- c('ext_wall_material', 'roof_material', 'basement_type', 'central_heating', 'garage_size', 'residence_type', 'nbhd_code', 'flood_risk_factor' )
+
+# convert to categorical
+train.df[categorical_vars] <- lapply(train.df[categorical_vars], as.factor)
+
+# structure
+str(train.df)
+
+# convert to categorical
+test.df[categorical_vars] <- lapply(test.df[categorical_vars], as.factor)
+
+# structure
+str(test.df)
+
+```
+
+
+## 3.5 Combine categories to reduce the number of unique groups and increase the number of observations in each group (focus on categorical variables)
+```{r}
+# check the groups under each variable# check the groups under each variable
+table(train.df$ext_wall_material)
+table(train.df$roof_material)
+table(train.df$basement_type)
+table(train.df$central_heating)
+table(train.df$garage_size)
+table(train.df$residence_type)
+table(train.df$nbhd_code)
+table(train.df$flood_risk_factor)
+
+# almost all the categories has similar in each group, no need to combine. nbhd_code is at a granular level, so combining them is not a good idea.
+
+```
+
+# 4 Analysis
+## 4.1 Probability Distribution of Predict(Outcome) Variable
+```{r}
+# Visualize the distribution with a bar plot
+ggplot(train.df, aes(x = sale_price)) +
+  geom_density(fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Sales Prices",
+       x = "Sales Price",
+       y = "Density") +
+  theme_minimal()
+
+```
+
+## 4.2 Lasso Regression
+### 4.2.1 Create x for input perdictors matrix and y for outcome vector
+```{r eval=FALSE, include=FALSE}
+# convert a data frame of predictors to a matrix
+# train data
+x_train <- model.matrix(sale_price ~ ., train.df)[,-1]
+# model.matrix creates dummy variables for character variables
+head(x_train)
+
+# matrix
+is.matrix(x_train)
+
+# outcome
+y_train <- train.df$sale_price
+
+# vector
+is.vector(y_train)
+
+# test data
+x_test <- model.matrix(sale_price ~ ., test.df)[,-1]
+# model.matrix creates dummy variables for character variables
+head(x_test)
+
+# matrix
+is.matrix(x_test)
+
+# outcome
+y_test <- test.df$sale_price
+
+# vector
+is.vector(y_test)
+
+```
+
+### 4.2.2 Run the Model
+```{r eval=FALSE, include=FALSE}
+# fit a lasso regression model 
+set.seed(1)
+fit<- glmnet(x_train,y_train,alpha=1)
+# alpha=1 specifies a lasso regression model 
+
+# sequence of lambda values 
+fit$lambda
+
+# dimension of lasso regression coefficients 
+dim(coef(fit))
+
+# plot coefficients on log of lambda values 
+plot(fit, xvar="lambda")
+
+```
+
+### 4.2.3 Cross-validation to choose best lambda
+```{r eval=FALSE, include=FALSE}
+# fit a lasso regression model with 10-fold cross-validation on the training set 
+set.seed(1)
+cv.fit <- cv.glmnet(x_train, y_train, alpha=1, type.measure="mse")
+# alpha=1 specifies a lasso regression model 
+# type.measure="mse" specifies the criterion: cross-validated MSE 
+# nfold=10 performs 10-fold cross validation by default 
+
+# cross-validated MSE for each lambda 
+plot(cv.fit)
+
+# lambda that corresponds to the lowest cross-validated MSE 
+lambda.best <- cv.fit$lambda.min
+lambda.best
+
+# vertical line on the graph 
+log(lambda.best)
+
+```
+
+### 4.2.4 Predict for test data using the best lambda
+```{r eval=FALSE, include=FALSE}
+# lasso regression coefficients  
+coef.lambda.best <- predict(cv.fit,s=lambda.best,type="coefficients")[1:32,]
+coef.lambda.best
+
+# non-zero coefficients 
+coef.lambda.best[coef.lambda.best!=0]
+
+# make predictions for records the test set 
+pred.lambda.best <- predict(cv.fit,s=lambda.best,newx=x_test)
+head(pred.lambda.best)
+
+# MSE in the test set 
+mse <- mean((y_test-pred.lambda.best)^2)
+
+#RMSE in test set
+rmse <- sqrt(mse)
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+
+```
+
+## 4.4 Gradient Boost - XGBoost
+### 4.4.1 Creation of features and target sets
+```{r}
+# Set seed for reproducibility
+set.seed(1)
+
+# Separate the features and the target variable
+features <- train.df[, names(train.df) != "sale_price"]
+target <- train.df$sale_price
+
+# Apply one-hot encoding to the features
+features_dummies <- dummyVars(" ~ .", data = features)
+train_data_transformed <- predict(features_dummies, newdata = features)
+
+# Convert to matrix
+train_matrix <- as.matrix(train_data_transformed)
+dtrain <- xgb.DMatrix(data = train_matrix, label = target)
+```
+
+### 4.4.2 Train the model
+```{r}
+# Define parameters for the XGBoost model
+params <- list(
+    objective = "reg:squarederror",  # for regression tasks
+    eta = 0.1,
+    max_depth = 6,
+    nthread = 3
+)
+
+# Train the model
+xgb_model <- xgb.train(params, dtrain, nrounds = 1000)
+
+# Variable importance
+importance_matrix <- xgb.importance(feature_names = colnames(train_matrix), model = xgb_model)
+print(importance_matrix)
+
+```
+
+### 4.4.3 Train Set - R and R-squared value
+```{r}
+# Predict on training data
+train_predictions <- predict(xgb_model, dtrain)
+
+# Calculate R-squared for the training data
+train_SST <- sum((train.df$sale_price - mean(train.df$sale_price))^2)
+train_SSR <- sum((train.df$sale_price - train_predictions)^2)
+train_R_squared <- 1 - (train_SSR / train_SST)
+
+# Calculate R (correlation coefficient)
+train_R <- sqrt(train_R_squared)
+
+# Print R and R-squared values
+print(paste("Training R-squared: ", train_R_squared))
+print(paste("Training R: ", train_R))
+
+```
+
+### 4.4.4 Variable Importance
+```{r}
+# Use the importance_matrix from the xgb.importance function
+ggplot(importance_matrix, aes(x = Feature, y = Gain)) +
+  geom_col(fill = "blue") +
+  coord_flip() +
+  ggtitle("Variable Importance") +
+  xlab("Features") +
+  ylab("Gain") +
+  theme_minimal()
+
+```
+
+### 4.4.5 Model prediction
+```{r}
+# Apply the same preprocessing to test.df
+test_features <- test.df[, names(test.df) != "sale_price"]
+test_data_transformed <- predict(features_dummies, newdata = test_features)
+test_matrix <- as.matrix(test_data_transformed)
+dtest <- xgb.DMatrix(data = test_matrix)
+
+# Predicting
+predictions <- predict(xgb_model, dtest)
+
+# Evaluating model performance
+mse <- mean((test.df$sale_price - predictions)^2)
+print(paste("Mean Squared Error: ", mse))
+
+#RMSE in test set
+rmse <- sqrt(mse)
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+```
+
+### 4.4.6 Test Set - R and R-squared value
+```{r}
+# Predict on test data
+test_predictions <- predict(xgb_model, dtest)
+
+# Calculate R-squared for the test data
+test_SST <- sum((test.df$sale_price - mean(test.df$sale_price))^2)
+test_SSR <- sum((test.df$sale_price - test_predictions)^2)
+test_R_squared <- 1 - (test_SSR / test_SST)
+
+# Calculate R (correlation coefficient)
+test_R <- sqrt(test_R_squared)
+
+# Print R and R-squared values
+print(paste("Test R-squared: ", test_R_squared))
+print(paste("Test R: ", test_R))
+
+```
+
+### 4.4.7 Actual Vs Predicted values
+```{r}
+# Actual vs Predicted Chart
+plot_data <- data.frame(Actual = test.df$sale_price, Predicted = predictions)
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point(color = 'blue') +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  ggtitle("Actual vs Predicted Values") +
+  xlab("Actual Sale Price") +
+  ylab("Predicted Sale Price") +
+  theme_minimal()
+
+
+```
+
+### 4.4.8  R and R-Squared Values Visualization
+```{r}
+# Combine R and R-squared values in a dataframe
+r_values <- data.frame(
+  Data = c("Training", "Test"),
+  R_Squared = c(train_R_squared, test_R_squared),
+  R = c(train_R, test_R)
+)
+
+# Plot for R-Squared
+ggplot(r_values, aes(x = Data, y = R_Squared, fill = Data)) +
+  geom_bar(stat = "identity") +
+  ggtitle("R-Squared Values for Training and Test Data") +
+  ylab("R-Squared") +
+  theme_minimal()
+
+# Plot for R
+ggplot(r_values, aes(x = Data, y = R, fill = Data)) +
+  geom_bar(stat = "identity") +
+  ggtitle("R Values for Training and Test Data") +
+  ylab("R") +
+  theme_minimal()
+
+```
+
+# 5 Prediction
+## 5.1 Predict data load
+```{r}
+# load the data as dataframe
+predict_data <- read.csv("predict_property_data.csv")
+
+# first six rows
+head(predict_data)
+
+# column names
+names(predict_data)
+
+# structure
+str(predict_data)
+
+# size
+dim(predict_data)
+
+```
+
+## 5.2 Predict dataset Cleaning and Preprocessing
+### 5.2.1 Choose columns - predictors
+```{r}
+# rename columns
+predict_data <- predict_data[, c('pid', 'meta_nbhd', 'char_hd_sf', 'char_age', 'char_apts', 'char_ext_wall', 'char_roof_cnst', 'char_rooms', 'char_beds', 'char_bsmt', 'char_bsmt_fin', 'char_heat', 'char_oheat', 'char_air', 'char_frpl', 'char_attic_type', 'char_fbath', 'char_hbath', 'char_tp_plan', 'char_tp_dsgn', 'char_gar1_size', 'char_gar1_cnst', 'char_gar1_att', 'char_gar1_area', 'char_bldg_sf', 'char_use', 'char_type_resd', 'char_attic_fnsh', 'char_porch', 'geo_ohare_noise', 'geo_floodplain', 'geo_fs_flood_factor', 'geo_fs_flood_risk_direction', 'geo_withinmr100', 'geo_withinmr101300')]
+
+
+# rename the columns
+colnames(predict_data) <- c('pid', 'nbhd_code', 'land_area_sqft', 'property_age', 'number_apts', 'ext_wall_material', 'roof_material', 'number_rooms', 'number_beds', 'basement_type', 'basement_finish', 'central_heating', 'other_heating', 'central_air_conditioning', 'number_fireplaces', 'attic_type', 'number_full_bath', 'number_half_bath', 'design_plan', 'cathedral_ceiling', 'garage_size', 'garage_material', 'garage_attached', 'garage_area', 'buidling_area_sqft', 'usage_type', 'residence_type', 'attic_finish', 'porch_type', 'noise_indicator', 'fema_floodplain', 'flood_risk_factor', 'food_risk_direction', 'road_prox_within_100', 'road_prox_within_101_to_300')
+
+# Find common columns between test.df and predict_data
+common_cols <- intersect(names(test.df), names(predict_data))
+
+# Include "pid" from test.df
+common_cols <- c("pid", setdiff(common_cols, "pid"))
+
+# Select columns in predict_data that are also in training
+predict_data <- predict_data[, common_cols]
+head(predict_data)
+
+```
+
+### 5.2.2 Normalize with Training Data - Replace missing values with non-missing values
+```{r}
+# number of NA in each variable
+sapply(predict_data, function(x) sum(is.na(x)))
+
+# function to calculate the mode (most common element)
+get_mode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# impute missing values based on the median or mode of 'nbhd_code'(neighborhood). Because we assume that the following characteristics can be quite consistent within the same neighborhood.
+predict_data <- predict_data %>%
+  group_by(nbhd_code) %>%
+  mutate(
+    ext_wall_material = ifelse(is.na(ext_wall_material), get_mode(ext_wall_material), ext_wall_material),
+    roof_material = ifelse(is.na(roof_material), get_mode(roof_material), roof_material),
+    basement_type = ifelse(is.na(basement_type), get_mode(basement_type), basement_type),
+    central_heating = ifelse(is.na(central_heating), get_mode(central_heating), central_heating),
+    number_fireplaces = ifelse(is.na(number_fireplaces), median(number_fireplaces, na.rm = TRUE), number_fireplaces),
+    garage_size = ifelse(is.na(garage_size), get_mode(garage_size), garage_size),
+    residence_type = ifelse(is.na(residence_type), get_mode(residence_type), residence_type),
+    flood_risk_factor = ifelse(is.na(flood_risk_factor), get_mode(flood_risk_factor), flood_risk_factor)
+  )
+
+# check the missing values 
+missing_values_predict <- colSums(is.na(predict_data))
+missing_values_predict
+
+# convert to data frame from tibble
+predict_data <- data.frame(predict_data)
+head(predict_data)
+
+```
+
+### 5.2.3 Normalize with Training Data - Winsorize numeric variables
+```{r}
+# custom function to winsorize a vector
+winsorize <- function(x, low_perc = 0.05, high_perc = 0.95) {
+  quantiles <- quantile(x, probs = c(low_perc, high_perc), na.rm = TRUE)
+  x[x < quantiles[1]] <- quantiles[1]
+  x[x > quantiles[2]] <- quantiles[2]
+  x
+}
+
+# winsorize multiple columns excluding "pid"
+numeric_vars_predict <- sapply(predict_data, is.numeric)
+numeric_vars_predict <- setdiff(names(numeric_vars_predict), "pid")
+
+predict_data[numeric_vars_predict] <- lapply(predict_data[numeric_vars_predict], winsorize)
+
+# summary
+summary(predict_data)
+
+```
+
+### 5.2.4 Convert some numeric variables to factors
+```{r}
+# convert to categorical
+predict_data[categorical_vars] <- lapply(predict_data[categorical_vars], as.factor)
+
+# structure
+str(predict_data)
+
+```
+
+### 5.2.5 Run the model to predict - Random Forecast
+```{r}
+# one-hot encoding for the training data, apply it here as well
+predict_data_transformed <- predict(features_dummies, newdata = predict_data)
+
+# Convert to matrix
+predict_matrix <- as.matrix(predict_data_transformed)
+
+# Create DMatrix for predict_data
+dpredict <- xgb.DMatrix(data = predict_matrix)
+
+# Predict using the XGBoost model
+predict_data$assessed_value <- predict(xgb_model, dpredict)
+
+# identify rows with negative or missing values in assessed_value
+rows_to_replace <- which(predict_data$assessed_value < 0 | is.na(predict_data$assessed_value))
+
+# calculate the mean of nbhd_code column (assuming it's numeric)
+mean_nbhd_code <- mean(predict_data$nbhd_code, na.rm = TRUE)
+
+# replace only the identified rows' assessed_value with mean_nbhd_code
+predict_data$assessed_value[rows_to_replace] <- mean_nbhd_code
+
+```
+
+### 5.2.6 Assessed Value file
+```{r}
+# create a new dataframe with two columns: pid and assessed_value
+final_data <- data.frame(pid = predict_data$pid, assessed_value = predict_data$assessed_value)
+
+# export as CSV
+write.csv(final_data, "assessed_value.csv", row.names = FALSE)
+
+```
